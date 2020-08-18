@@ -15,9 +15,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net"
+	"net/http"
 	"os"
 	"time"
 
@@ -41,6 +45,8 @@ import (
 const (
 	listenPort  = "5050"
 	usdCurrency = "USD"
+	pdEventsAPI = "https://events.pagerduty.com/v2/enqueue"
+	client      = "OnlineDuty"
 )
 
 var log *logrus.Logger
@@ -66,6 +72,7 @@ type checkoutService struct {
 	shippingSvcAddr       string
 	emailSvcAddr          string
 	paymentSvcAddr        string
+	pagerdutyToken        string
 }
 
 func main() {
@@ -95,6 +102,7 @@ func main() {
 	mustMapEnv(&svc.currencySvcAddr, "CURRENCY_SERVICE_ADDR")
 	mustMapEnv(&svc.emailSvcAddr, "EMAIL_SERVICE_ADDR")
 	mustMapEnv(&svc.paymentSvcAddr, "PAYMENT_SERVICE_ADDR")
+	mustMapEnv(&svc.pagerdutyToken, "PAGERDUTY_TOKEN")
 
 	log.Infof("service config: %+v", svc)
 
@@ -218,6 +226,20 @@ func (cs *checkoutService) Watch(req *healthpb.HealthCheckRequest, ws healthpb.H
 func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderRequest) (*pb.PlaceOrderResponse, error) {
 	log.Infof("[PlaceOrder] user_id=%q user_currency=%q", req.UserId, req.UserCurrency)
 
+	// TESTING PAYLOADS
+
+	// Fire off calls on a given schedule.
+	// Website Incident
+	time.AfterFunc(3000*time.Millisecond, cs.transactionFailure)
+	time.AfterFunc(5000*time.Millisecond, cs.transactionTimeout)
+	time.AfterFunc(5000*time.Millisecond, cs.highCPU)
+	time.AfterFunc(5500*time.Millisecond, cs.customerIssues)
+
+	// Send additional alerts outside main incident.
+	time.AfterFunc(30000*time.Millisecond, cs.cloudWatchBill)
+	time.AfterFunc(60000*time.Millisecond, cs.outOfMemory)
+	time.AfterFunc(60000*time.Millisecond, cs.lowRevenue)
+
 	orderID, err := uuid.NewUUID()
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to generate order uuid")
@@ -238,6 +260,8 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
 
 	txID, err := cs.chargeCard(ctx, &total, req.CreditCard)
 	if err != nil {
+		log.Fatalf("Failure: Unable to charge card (order_id: %s)", orderID)
+		// LOGIC TBA
 		return nil, status.Errorf(codes.Internal, "failed to charge card: %+v", err)
 	}
 	log.Infof("payment went through (transaction_id: %s)", txID)
@@ -428,3 +452,165 @@ func (cs *checkoutService) shipOrder(ctx context.Context, address *pb.Address, i
 }
 
 // TODO: Dial and create client once, reuse.
+
+/*
+	PagerDuty Alert Logic
+*/
+
+// AlertPayload : This is the PD-CEF compliant payload.
+type AlertPayload struct {
+	Summary   string `json:"summary"`
+	Severity  string `json:"severity"`
+	Component string `json:"component"`
+	Source    string `json:"source"`
+	Group     string `json:"group"`
+	Class     string `json:"class"`
+}
+
+// Alert : This is the alert used in the JSON BODY.
+type Alert struct {
+	AlertPayload AlertPayload `json:"payload"`
+	RoutingKey   string       `json:"routing_key"`
+	DedupKey     string       `json:"dedup_key"`
+	EventAction  string       `json:"event_action"`
+}
+
+func (cs *checkoutService) sendPDAlert(alert *Alert) {
+
+	log.Warnf("Sending alert to PagerDuty")
+
+	// Convert alert struct to JSON string via marshal + bytes buffer.
+	alertPayload, _ := json.Marshal(alert)
+	alertPayloadBytes := bytes.NewBuffer(alertPayload)
+
+	// Submit alert to PD API and log response.
+	res, err := http.Post(pdEventsAPI, "application/json", alertPayloadBytes)
+
+	if err != nil {
+		log.Errorf(err.Error())
+	}
+
+	body, err := ioutil.ReadAll(res.Body)
+	log.Infof(string(body))
+
+}
+
+func (cs *checkoutService) transactionFailure() {
+	alert := &Alert{
+		AlertPayload: AlertPayload{
+			Summary:   "500 Internal Server Error: Unavailable desc = all SubConns are in TransientFailure",
+			Severity:  "critical",
+			Component: "frontend",
+			Source:    "Datadog",
+			Group:     "prod",
+			Class:     "transaction",
+		},
+		RoutingKey:  cs.pagerdutyToken,
+		DedupKey:    fmt.Sprintf("%s_datadog_frontend_failure", client),
+		EventAction: "trigger",
+	}
+	cs.sendPDAlert(alert)
+}
+
+func (cs *checkoutService) transactionTimeout() {
+	id := uuid.New()
+	alert := &Alert{
+		AlertPayload: AlertPayload{
+			Summary:   fmt.Sprintf("Error: Transaction timeout (ID: %s)", id),
+			Severity:  "error",
+			Component: "frontend",
+			Source:    "Datadog",
+			Group:     "prod",
+			Class:     "transaction",
+		},
+		RoutingKey:  cs.pagerdutyToken,
+		DedupKey:    fmt.Sprintf("%s_datadog_frontend_timeout", client),
+		EventAction: "trigger",
+	}
+	cs.sendPDAlert(alert)
+}
+
+func (cs *checkoutService) customerIssues() {
+	alert := &Alert{
+		AlertPayload: AlertPayload{
+			Summary:   "Warning: Increased customer reports of website failure by 25%",
+			Severity:  "warning",
+			Component: "frontend",
+			Source:    "Zendesk",
+			Group:     "prod",
+			Class:     "helpdesk",
+		},
+		RoutingKey:  cs.pagerdutyToken,
+		DedupKey:    fmt.Sprintf("%s_zendesk_frontend_customer_reports", client),
+		EventAction: "trigger",
+	}
+	cs.sendPDAlert(alert)
+}
+
+func (cs *checkoutService) highCPU() {
+	alert := &Alert{
+		AlertPayload: AlertPayload{
+			Summary:   "Warning: Increased Response Time Detected - Avg 9595ms | 90% CPU",
+			Severity:  "warning",
+			Component: "frontend",
+			Source:    "Datadog",
+			Group:     "prod",
+			Class:     "core-stats",
+		},
+		RoutingKey:  cs.pagerdutyToken,
+		DedupKey:    fmt.Sprintf("%s_datadog_high_cpu", client),
+		EventAction: "trigger",
+	}
+	cs.sendPDAlert(alert)
+}
+
+func (cs *checkoutService) outOfMemory() {
+	alert := &Alert{
+		AlertPayload: AlertPayload{
+			Summary:   "Warning: java.lang.OutOfMemoryError: Java heap space",
+			Severity:  "warning",
+			Component: "payment",
+			Source:    "Datadog",
+			Group:     "prod",
+			Class:     "db-connection",
+		},
+		RoutingKey:  cs.pagerdutyToken,
+		DedupKey:    fmt.Sprintf("%s_grafana_123", client),
+		EventAction: "trigger",
+	}
+	cs.sendPDAlert(alert)
+}
+
+func (cs *checkoutService) lowRevenue() {
+	alert := &Alert{
+		AlertPayload: AlertPayload{
+			Summary:   "Warning: Low revenue detected - under $100k USD across 5 minute period",
+			Severity:  "warning",
+			Component: "checkout",
+			Source:    "Anodot",
+			Group:     "prod",
+			Class:     "revenue",
+		},
+		RoutingKey:  cs.pagerdutyToken,
+		DedupKey:    fmt.Sprintf("%s_anodot", client),
+		EventAction: "trigger",
+	}
+	cs.sendPDAlert(alert)
+}
+
+func (cs *checkoutService) cloudWatchBill() {
+	alert := &Alert{
+		AlertPayload: AlertPayload{
+			Summary:   "Warning: Build 1.8.20-g0c85fbc delayed; estimated charges breached (+5 USD)",
+			Severity:  "warning",
+			Component: "payment",
+			Source:    "AWS CloudWatch",
+			Group:     "uat",
+			Class:     "build-metrics",
+		},
+		RoutingKey:  cs.pagerdutyToken,
+		DedupKey:    fmt.Sprintf("%s_aws_cloudwatch", client),
+		EventAction: "trigger",
+	}
+	cs.sendPDAlert(alert)
+}
